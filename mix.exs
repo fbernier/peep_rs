@@ -11,18 +11,22 @@ defmodule Peep.Storage.RustNIF.MixProject do
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
   def application do
     [
       extra_applications: [:logger]
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
+      {:peep, path: "../../elixir/peep-rust"},
+      # Forked for `Term::hash_internal/1`: upstream truncates
+      # `ERL_NIF_INTERNAL_HASH` to 32 bits, and the shard maps are keyed by it.
+      {:rustler,
+       git: "https://github.com/rkallos/rustler.git",
+       branch: "fix/internal-hash-64bit",
+       sparse: "rustler_mix",
+       runtime: false}
     ]
   end
 end

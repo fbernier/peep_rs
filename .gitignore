@@ -22,3 +22,12 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 peep_rs-*.tar
 
+
+# Rust binary artifacts
+/target/
+
+# Rustler compiles the crate into priv/native/ on every `mix compile`.
+/priv/native/
+
+# direnv
+/.direnv/

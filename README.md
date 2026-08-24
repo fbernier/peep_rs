@@ -1,21 +1,30 @@
 # Peep.Storage.RustNIF
 
-**TODO: Add description**
+A [Peep](https://github.com/rkallos/peep) storage backend implemented as a Rust
+NIF via [Rustler](https://github.com/rusterlium/rustler).
 
-## Installation
-
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `peep_rs` to your list of dependencies in `mix.exs`:
+`Peep.Storage.RustNIF` implements the `Peep.Storage` behaviour, so it can be
+passed as the `:storage` option to `Peep.start_link/1`:
 
 ```elixir
-def deps do
-  [
-    {:peep_rs, "~> 0.1.0"}
-  ]
-end
+Peep.start_link(
+  name: :my_peep,
+  metrics: metrics,
+  storage: {Peep.Storage.RustNIF, []}
+)
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/peep_rs>.
+## Development
 
+`mix compile` builds the Rust crate under `native/peep_storage_rustler`, so a
+Rust toolchain (`cargo`) must be on `PATH`. A Nix flake providing Erlang,
+Elixir, and the Rust toolchain is included:
+
+    direnv allow   # or: nix develop
+
+`peep` is a path dependency (see `mix.exs`). The test suite runs Peep's shared
+storage conformance tests (`test/shared/storage_test.exs`, shipped with the peep
+dependency) against the Rust NIF backend, plus backend-specific tests in
+`test/peep/storage/rust_nif_test.exs`:
+
+    mix test
