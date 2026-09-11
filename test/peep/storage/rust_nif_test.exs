@@ -170,8 +170,8 @@ defmodule Peep.Storage.RustNIFTest do
              %{gauge => %{%{type: :integer} => 10, %{type: :float} => 10.5}}
   end
 
-  test "descending bucket boundaries are rejected" do
-    for boundaries <- [[1000, 100, 10]] do
+  test "bucket boundaries must be strictly increasing" do
+    for boundaries <- [[1000, 100, 10], [10, 10, 100]] do
       dist =
         Metrics.distribution("rustler.test.boundaries")
         |> Map.put(:peep_bucket_boundaries, boundaries)
@@ -240,6 +240,36 @@ defmodule Peep.Storage.RustNIFTest do
 
       assert RustNIF.nif_get_all_metrics(storage, {gauge}) === %{gauge => %{%{} => 0.0}}
     end
+  end
+
+  test "an ids_to_metrics tuple that does not match registration is rejected" do
+    counter = Metrics.counter("rustler.test.mismatch")
+    sum = Metrics.sum("rustler.test.mismatch.sum")
+    storage = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {counter, sum})
+    :ok = RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [{0, counter, 1, 0}])
+
+    for wrong <- [{}, {sum, counter}] do
+      error = assert_raise ErlangError, fn -> RustNIF.nif_get_all_metrics(storage, wrong) end
+      assert {:peep_storage_error, :metrics_mismatch, _} = error.original
+    end
+
+    assert RustNIF.nif_get_all_metrics(storage, {counter, sum}) == %{counter => %{%{} => 1}}
+  end
+
+  test "a repeated metric is rejected at registration" do
+    counter = Metrics.counter("rustler.test.repeated")
+    storage = RustNIF.new([])
+
+    error =
+      assert_raise ErlangError, fn ->
+        RustNIF.register_metrics(storage, {counter, counter})
+      end
+
+    assert {:peep_storage_error, :bad_argument, _} = error.original
+
+    other = Metrics.counter("rustler.test.repeated.other")
+    assert :ok = RustNIF.register_metrics(storage, {counter, other})
   end
 
   # `Macro.escape/1` cannot carry a live pid or reference into the generated test.

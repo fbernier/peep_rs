@@ -37,6 +37,7 @@ mod atoms {
         bad_tag_index,
         bad_measurement,
         unsorted_boundaries,
+        metrics_mismatch,
         map_build_failed,
     }
 }
@@ -157,6 +158,22 @@ enum MetricSlot {
     },
 }
 
+impl MetricSlot {
+    /// Whether the caller's metric has the kind registered at this position.
+    fn describes(&self, metric: Term) -> bool {
+        let expected = match self {
+            MetricSlot::Counter(_) => atoms::metric_counter(),
+            MetricSlot::Sum(_) => atoms::metric_sum(),
+            MetricSlot::LastValue(_) => atoms::metric_last_value(),
+            MetricSlot::Distribution { .. } => atoms::metric_distribution(),
+        };
+        metric
+            .map_get(rustler::types::atom::__struct__())
+            .and_then(Term::decode::<Atom>)
+            .is_ok_and(|struct_name| struct_name == expected)
+    }
+}
+
 // Matches crossbeam_utils::CachePadded for x86_64 and aarch64
 #[repr(align(128))]
 struct CachePadded<T>(T);
@@ -207,6 +224,8 @@ enum StorageError {
     UnknownMetricId(usize),
     BadTagIndex(usize),
     UnsortedBoundaries,
+    MetricsLenMismatch { got: usize, want: usize },
+    MetricKindMismatch { id: usize },
     AlreadyRegistered,
     NotRegistered,
 }
@@ -221,6 +240,9 @@ impl StorageError {
             StorageError::UnknownMetricId(_) => atoms::unknown_metric_id(),
             StorageError::BadTagIndex(_) => atoms::bad_tag_index(),
             StorageError::UnsortedBoundaries => atoms::unsorted_boundaries(),
+            StorageError::MetricsLenMismatch { .. } | StorageError::MetricKindMismatch { .. } => {
+                atoms::metrics_mismatch()
+            }
             StorageError::AlreadyRegistered => atoms::already_registered(),
             StorageError::NotRegistered => atoms::not_registered(),
         }
@@ -235,7 +257,13 @@ impl StorageError {
             StorageError::UnknownMetricId(id) => format!("no metric registered for id {id}"),
             StorageError::BadTagIndex(idx) => format!("no tags map at index {idx}"),
             StorageError::UnsortedBoundaries => {
-                "Peep.Buckets.boundaries/1 must return ascending values".into()
+                "Peep.Buckets.boundaries/1 must return strictly ascending values".into()
+            }
+            StorageError::MetricsLenMismatch { got, want } => {
+                format!("ids_to_metrics has {got} metrics, but {want} were registered")
+            }
+            StorageError::MetricKindMismatch { id } => {
+                format!("the metric at index {id} is not the kind registered there")
             }
             StorageError::AlreadyRegistered => "register_metrics was already called".into(),
             StorageError::NotRegistered => "register_metrics has not been called".into(),
@@ -276,8 +304,32 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
     let mut boundaries_arena: Vec<Measurement> = Vec::new();
     let mut interned: Vec<(Vec<Measurement>, usize)> = Vec::new();
 
-    let metrics = get_tuple(ids_to_metrics)
-        .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?
+    let metric_terms = get_tuple(ids_to_metrics)
+        .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
+    // Scrape output keys must be unique before the registry is published.
+    let mut seen: HashMap<TagsKey, (), TermHashBuilder> =
+        HashMap::with_capacity_and_hasher(metric_terms.len(), TermHashBuilder::default());
+    for metric in &metric_terms {
+        let key = TagsKey {
+            hash: metric.hash_internal(0),
+            term: metric.as_c_arg(),
+        };
+        match seen
+            .raw_entry_mut()
+            .from_hash(key.hash, |seen| *seen == key)
+        {
+            RawEntryMut::Occupied(_) => {
+                return Err(
+                    StorageError::BadArgument("ids_to_metrics must not repeat a metric").into(),
+                );
+            }
+            RawEntryMut::Vacant(entry) => {
+                entry.insert(key, ());
+            }
+        }
+    }
+
+    let metrics = metric_terms
         .into_iter()
         .map(|metric| metric_slot_for(metric, &mut boundaries_arena, &mut interned, n_shards))
         .collect::<Result<_, _>>()?;
@@ -345,7 +397,7 @@ fn intern_boundaries(
     interned: &mut Vec<(Vec<Measurement>, usize)>,
     boundaries: Vec<Measurement>,
 ) -> Result<(usize, usize), StorageError> {
-    if !boundaries.is_sorted_by(|a, b| !a.cmp_exact(*b).is_gt()) {
+    if !boundaries.is_sorted_by(|a, b| a.cmp_exact(*b).is_lt()) {
         return Err(StorageError::UnsortedBoundaries);
     }
 
@@ -562,6 +614,20 @@ fn nif_get_all_metrics<'a>(
 
     let metric_terms = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
+
+    // The tuple supplies output keys; length and kind must match the registry.
+    if metric_terms.len() != registered.metrics.len() {
+        return Err(StorageError::MetricsLenMismatch {
+            got: metric_terms.len(),
+            want: registered.metrics.len(),
+        }
+        .into());
+    }
+    for (metric_id, (metric, slot)) in metric_terms.iter().zip(&registered.metrics).enumerate() {
+        if !slot.describes(*metric) {
+            return Err(StorageError::MetricKindMismatch { id: metric_id }.into());
+        }
+    }
 
     let mut outer_keys = Vec::new();
     let mut outer_vals = Vec::new();
