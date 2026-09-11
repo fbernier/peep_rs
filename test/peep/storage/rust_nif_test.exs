@@ -1,3 +1,23 @@
+defmodule Peep.Storage.RustNIFTest.SameLabelBuckets do
+  @behaviour Peep.Buckets
+
+  @impl true
+  def config(_), do: %{}
+
+  @impl true
+  def boundaries(_), do: [10, 100]
+
+  @impl true
+  def bucket_for(_, _), do: 0
+
+  # Distinct bounds can collide after label formatting.
+  @impl true
+  def upper_bound(_, _), do: "same"
+
+  @impl true
+  def number_of_buckets(_), do: 2
+end
+
 defmodule Peep.Storage.RustNIFTest do
   # NIF-specific validation and term round-trips.
   use ExUnit.Case, async: true
@@ -107,7 +127,7 @@ defmodule Peep.Storage.RustNIFTest do
       |> Map.put(:peep_bucket_labels, ["10", :infinity])
 
     storage = RustNIF.new([])
-    :ok = RustNIF.register_metrics(storage, {sum, gauge, dist})
+    :ok = RustNIF.nif_register_metrics(storage, {sum, gauge, dist})
     before = RustNIF.storage_size(storage)
 
     for {id, metric, value, reason} <- [
@@ -179,11 +199,26 @@ defmodule Peep.Storage.RustNIFTest do
 
       error =
         assert_raise ErlangError, fn ->
-          RustNIF.register_metrics(RustNIF.new([]), {dist})
+          RustNIF.nif_register_metrics(RustNIF.new([]), {dist})
         end
 
       assert {:peep_storage_error, :unsorted_boundaries, _} = error.original
     end
+  end
+
+  test "duplicate labels from a bucket calculator are rejected at registration" do
+    dist =
+      Metrics.distribution("rustler.test.same_label",
+        reporter_options: [peep_bucket_calculator: __MODULE__.SameLabelBuckets]
+      )
+      |> Map.put(:peep_bucket_boundaries, [10, 100])
+
+    error =
+      assert_raise ErlangError, fn ->
+        RustNIF.register_metrics(RustNIF.new([]), {dist})
+      end
+
+    assert {:peep_storage_error, :bad_argument, _} = error.original
   end
 
   test "distribution sums and bucket routing retain integer precision past 2^53" do
@@ -195,7 +230,7 @@ defmodule Peep.Storage.RustNIFTest do
       |> Map.put(:peep_bucket_labels, ["wide", :infinity])
 
     storage = RustNIF.new([])
-    :ok = RustNIF.register_metrics(storage, {dist})
+    :ok = RustNIF.nif_register_metrics(storage, {dist})
 
     :ok =
       RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [
@@ -204,7 +239,7 @@ defmodule Peep.Storage.RustNIFTest do
       ])
 
     assert RustNIF.nif_get_all_metrics(storage, {dist}) ===
-             %{dist => %{%{} => %{0 => 1, :infinity => 1, :sum => 2 * boundary - 1}}}
+             %{dist => %{%{} => %{"wide" => 1, :infinity => 1, :sum => 2 * boundary - 1}}}
   end
 
   test "a last_value tie compares integer and float values exactly" do

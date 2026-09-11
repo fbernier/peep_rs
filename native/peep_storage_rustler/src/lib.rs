@@ -26,7 +26,7 @@ mod atoms {
         metric_last_value = "Elixir.Telemetry.Metrics.LastValue",
         metric_distribution = "Elixir.Telemetry.Metrics.Distribution",
         peep_bucket_boundaries,
-        infinity,
+        peep_bucket_labels,
         sum,
         peep_storage_error,
         bad_tags_map,
@@ -60,9 +60,9 @@ fn monotonic_time_ns() -> i64 {
 
 struct TagsEnv(OwnedEnv);
 
-// SAFETY: the shard's `RwLock` guards this. `store` is the only operation that
-// allocates and takes `&mut self`, so it is reachable only through the write
-// guard; no stored term is ever read outside a guard.
+// SAFETY: shard environments are guarded by the shard's RwLock; labels_env
+// is immutable after OnceLock publication. Only store allocates, via &mut self
+// under a write guard or during registration. All other access is read-only.
 unsafe impl Sync for TagsEnv {}
 
 impl TagsEnv {
@@ -146,6 +146,12 @@ impl std::panic::RefUnwindSafe for Storage {}
 struct RegisteredMetrics {
     metrics: Vec<MetricSlot>,
     boundaries_arena: Box<[Measurement]>,
+    /// Sorted bucket keys plus `:sum`, owned by `labels_env` and immutable
+    /// after OnceLock publication.
+    labels_arena: Box<[NIF_TERM]>,
+    /// Bucket index or `SUM_SLOT` for each key in `labels_arena`.
+    order_arena: Box<[u32]>,
+    labels_env: TagsEnv,
 }
 
 enum MetricSlot {
@@ -154,12 +160,13 @@ enum MetricSlot {
     LastValue(Shards<LastValueCell>),
     Distribution {
         boundaries: (usize, usize),
+        /// One label per bucket, plus `:sum`.
+        labels: (usize, usize),
         shards: Shards<DistributionCell>,
     },
 }
 
 impl MetricSlot {
-    /// Whether the caller's metric has the kind registered at this position.
     fn describes(&self, metric: Term) -> bool {
         let expected = match self {
             MetricSlot::Counter(_) => atoms::metric_counter(),
@@ -167,12 +174,16 @@ impl MetricSlot {
             MetricSlot::LastValue(_) => atoms::metric_last_value(),
             MetricSlot::Distribution { .. } => atoms::metric_distribution(),
         };
+
         metric
             .map_get(rustler::types::atom::__struct__())
             .and_then(Term::decode::<Atom>)
             .is_ok_and(|struct_name| struct_name == expected)
     }
 }
+
+/// Reserved `order_arena` entry for `:sum`.
+const SUM_SLOT: u32 = u32::MAX;
 
 // Matches crossbeam_utils::CachePadded for x86_64 and aarch64
 #[repr(align(128))]
@@ -298,22 +309,24 @@ fn new(_opts: Term) -> ResourceArc<Storage> {
 //                              register_metrics                             //
 ///////////////////////////////////////////////////////////////////////////////
 
-#[rustler::nif]
-fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
-    let n_shards = scheduler_count();
-    let mut boundaries_arena: Vec<Measurement> = Vec::new();
-    let mut interned: Vec<(Vec<Measurement>, usize)> = Vec::new();
+// Registration copies labels and allocates per-metric, per-scheduler state.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn nif_register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
+    let mut registration = Registration::new();
 
     let metric_terms = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
-    // Scrape output keys must be unique before the registry is published.
+
+    // Duplicate metric keys would make map construction fail on every scrape.
     let mut seen: HashMap<TagsKey, (), TermHashBuilder> =
         HashMap::with_capacity_and_hasher(metric_terms.len(), TermHashBuilder::default());
+
     for metric in &metric_terms {
         let key = TagsKey {
             hash: metric.hash_internal(0),
             term: metric.as_c_arg(),
         };
+
         match seen
             .raw_entry_mut()
             .from_hash(key.hash, |seen| *seen == key)
@@ -321,7 +334,7 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
             RawEntryMut::Occupied(_) => {
                 return Err(
                     StorageError::BadArgument("ids_to_metrics must not repeat a metric").into(),
-                );
+                )
             }
             RawEntryMut::Vacant(entry) => {
                 entry.insert(key, ());
@@ -331,88 +344,167 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
 
     let metrics = metric_terms
         .into_iter()
-        .map(|metric| metric_slot_for(metric, &mut boundaries_arena, &mut interned, n_shards))
+        .map(|metric| registration.slot_for(metric))
         .collect::<Result<_, _>>()?;
-
-    let registered = RegisteredMetrics {
-        metrics,
-        boundaries_arena: boundaries_arena.into_boxed_slice(),
-    };
 
     storage
         .registered
-        .set(registered)
+        .set(registration.finish(metrics))
         .map_err(|_| StorageError::AlreadyRegistered)?;
 
     Ok(rustler::types::atom::ok())
 }
 
-fn metric_slot_for(
-    metric: Term,
-    arena: &mut Vec<Measurement>,
-    interned: &mut Vec<(Vec<Measurement>, usize)>,
+struct Registration {
     n_shards: usize,
-) -> Result<MetricSlot, StorageError> {
-    let struct_name: Atom = metric
-        .map_get(rustler::types::atom::__struct__())
-        .map_err(|_| StorageError::BadArgument("metric must be a struct"))?
-        .decode()
-        .map_err(|_| StorageError::BadArgument("__struct__ must be an atom"))?;
-
-    if struct_name == atoms::metric_counter() {
-        Ok(MetricSlot::Counter(Shards::new(n_shards)))
-    } else if struct_name == atoms::metric_sum() {
-        Ok(MetricSlot::Sum(Shards::new(n_shards)))
-    } else if struct_name == atoms::metric_last_value() {
-        Ok(MetricSlot::LastValue(Shards::new(n_shards)))
-    } else if struct_name == atoms::metric_distribution() {
-        // Preserve integer boundaries: f64 loses precision above 2^53.
-        let boundaries = metric
-            .map_get(atoms::peep_bucket_boundaries())
-            .map_err(|_| {
-                StorageError::BadArgument("Distribution metric must carry :peep_bucket_boundaries")
-            })?
-            .decode::<Vec<Term>>()
-            .map_err(|_| {
-                StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
-            })?
-            .into_iter()
-            .map(Measurement::decode)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| {
-                StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
-            })?;
-
-        Ok(MetricSlot::Distribution {
-            boundaries: intern_boundaries(arena, interned, boundaries)?,
-            shards: Shards::new(n_shards),
-        })
-    } else {
-        Err(StorageError::BadArgument("unrecognized metric struct"))
-    }
+    boundaries: Vec<Measurement>,
+    /// Distributions usually share a bucket layout, so boundary lists are
+    /// deduplicated into one arena. Linear scan: this runs once per metric at
+    /// boot, and metric counts are in the hundreds.
+    interned: Vec<(Vec<Measurement>, usize)>,
+    labels: Vec<NIF_TERM>,
+    order: Vec<u32>,
+    labels_env: TagsEnv,
 }
 
-fn intern_boundaries(
-    arena: &mut Vec<Measurement>,
-    interned: &mut Vec<(Vec<Measurement>, usize)>,
-    boundaries: Vec<Measurement>,
-) -> Result<(usize, usize), StorageError> {
-    if !boundaries.is_sorted_by(|a, b| a.cmp_exact(*b).is_lt()) {
-        return Err(StorageError::UnsortedBoundaries);
+impl Registration {
+    fn new() -> Self {
+        Registration {
+            n_shards: scheduler_count(),
+            boundaries: Vec::new(),
+            interned: Vec::new(),
+            labels: Vec::new(),
+            order: Vec::new(),
+            labels_env: TagsEnv::new(),
+        }
     }
 
-    if let Some((existing, offset)) = interned
-        .iter()
-        .find(|(existing, _)| existing == &boundaries)
-    {
-        return Ok((*offset, existing.len()));
+    fn finish(self, metrics: Vec<MetricSlot>) -> RegisteredMetrics {
+        RegisteredMetrics {
+            metrics,
+            boundaries_arena: self.boundaries.into_boxed_slice(),
+            labels_arena: self.labels.into_boxed_slice(),
+            order_arena: self.order.into_boxed_slice(),
+            labels_env: self.labels_env,
+        }
     }
 
-    let offset = arena.len();
-    arena.extend_from_slice(&boundaries);
-    let len = boundaries.len();
-    interned.push((boundaries, offset));
-    Ok((offset, len))
+    fn slot_for<'a>(&mut self, metric: Term<'a>) -> Result<MetricSlot, StorageError> {
+        let struct_name: Atom = metric
+            .map_get(rustler::types::atom::__struct__())
+            .map_err(|_| StorageError::BadArgument("metric must be a struct"))?
+            .decode()
+            .map_err(|_| StorageError::BadArgument("__struct__ must be an atom"))?;
+
+        if struct_name == atoms::metric_counter() {
+            Ok(MetricSlot::Counter(Shards::new(self.n_shards)))
+        } else if struct_name == atoms::metric_sum() {
+            Ok(MetricSlot::Sum(Shards::new(self.n_shards)))
+        } else if struct_name == atoms::metric_last_value() {
+            Ok(MetricSlot::LastValue(Shards::new(self.n_shards)))
+        } else if struct_name == atoms::metric_distribution() {
+            // Preserve integer boundaries: f64 loses precision above 2^53.
+            let boundaries = metric
+                .map_get(atoms::peep_bucket_boundaries())
+                .map_err(|_| {
+                    StorageError::BadArgument(
+                        "Distribution metric must carry :peep_bucket_boundaries",
+                    )
+                })?
+                .decode::<Vec<Term>>()
+                .map_err(|_| {
+                    StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
+                })?
+                .into_iter()
+                .map(Measurement::decode)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
+                })?;
+
+            let labels: Vec<Term> = metric
+                .map_get(atoms::peep_bucket_labels())
+                .map_err(|_| {
+                    StorageError::BadArgument("Distribution metric must carry :peep_bucket_labels")
+                })?
+                .decode()
+                .map_err(|_| StorageError::BadArgument(":peep_bucket_labels must be a list"))?;
+
+            if labels.len() != boundaries.len().saturating_add(1) {
+                return Err(StorageError::BadArgument(
+                    ":peep_bucket_labels must have one more entry than :peep_bucket_boundaries",
+                ));
+            }
+
+            Ok(MetricSlot::Distribution {
+                boundaries: self.intern_boundaries(boundaries)?,
+                labels: self.store_labels(metric.get_env(), &labels)?,
+                shards: Shards::new(self.n_shards),
+            })
+        } else {
+            Err(StorageError::BadArgument("unrecognized metric struct"))
+        }
+    }
+
+    /// Presort bucket keys once, rather than during each series' map construction.
+    fn store_labels<'a>(
+        &mut self,
+        env: Env<'a>,
+        labels: &[Term<'a>],
+    ) -> Result<(usize, usize), StorageError> {
+        let mut keys: Vec<(Term<'a>, u32)> = labels
+            .iter()
+            .enumerate()
+            .map(|(bucket, label)| (*label, bucket as u32))
+            .collect();
+
+        keys.push((atoms::sum().encode(env), SUM_SLOT));
+        keys.sort_by_key(|(key, _)| *key);
+
+        // Duplicate labels, including `:sum`, would make scrape maps fail to build.
+        if keys
+            .iter()
+            .zip(keys.iter().skip(1))
+            .any(|(a, b)| a.0 == b.0)
+        {
+            return Err(StorageError::BadArgument(
+                ":peep_bucket_labels must not repeat a bucket key",
+            ));
+        }
+
+        let offset = self.labels.len();
+        for (key, bucket) in &keys {
+            let stored = self.labels_env.store(key.as_c_arg());
+            self.labels.push(stored);
+            self.order.push(*bucket);
+        }
+
+        Ok((offset, keys.len()))
+    }
+
+    fn intern_boundaries(
+        &mut self,
+        boundaries: Vec<Measurement>,
+    ) -> Result<(usize, usize), StorageError> {
+        // Duplicate boundaries create buckets no measurement can reach.
+        if !boundaries.is_sorted_by(|a, b| a.cmp_exact(*b).is_lt()) {
+            return Err(StorageError::UnsortedBoundaries);
+        }
+
+        if let Some((existing, offset)) = self
+            .interned
+            .iter()
+            .find(|(existing, _)| existing == &boundaries)
+        {
+            return Ok((*offset, existing.len()));
+        }
+
+        let offset = self.boundaries.len();
+        self.boundaries.extend_from_slice(&boundaries);
+        let len = boundaries.len();
+        self.interned.push((boundaries, offset));
+        Ok((offset, len))
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -438,12 +530,13 @@ fn insert_metrics(
     // `u64::MAX` is the "not yet computed" sentinel. A `tag_idx` past the end
     // falls back to hashing per sample.
     let mut hashes = [u64::MAX; 8];
-    // Gauges in one event share a timestamp.
-    let mut now = None;
 
     let batch = batch
         .into_list_iterator()
         .map_err(|_| StorageError::BadArgument("batch must be a list"))?;
+
+    // Gauges in one event share a timestamp.
+    let mut now = None;
 
     for item in batch {
         // Avoids `Vec<Term>` allocations by `rustler::types::tuple::get_tuple`
@@ -511,12 +604,14 @@ fn store_one(
             shards.upsert(shard_id, tags, hash, sample, make, apply);
             Ok(())
         }
-        Some(MetricSlot::Distribution { boundaries, shards }) => {
+        Some(MetricSlot::Distribution {
+            boundaries, shards, ..
+        }) => {
             let (offset, len) = *boundaries;
             let boundaries = &registered.boundaries_arena[offset..offset + len];
             let measurement = Measurement::decode(value)?;
-            // Resolved before `upsert` can run, so a measurement that is
-            // going to be rejected cannot leave an empty series behind.
+            // Validate before upsert so a rejected measurement cannot leave
+            // an empty series behind.
             let delta = measurement.rounded()?;
             let make = |measurement: Measurement| {
                 let cell = DistributionCell::new(len);
@@ -615,7 +710,8 @@ fn nif_get_all_metrics<'a>(
     let metric_terms = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?;
 
-    // The tuple supplies output keys; length and kind must match the registry.
+    // Check tuple shape and metric kinds, not identity: retaining the original
+    // metric terms would also retain their functions.
     if metric_terms.len() != registered.metrics.len() {
         return Err(StorageError::MetricsLenMismatch {
             got: metric_terms.len(),
@@ -623,8 +719,10 @@ fn nif_get_all_metrics<'a>(
         }
         .into());
     }
-    for (metric_id, (metric, slot)) in metric_terms.iter().zip(&registered.metrics).enumerate() {
-        if !slot.describes(*metric) {
+
+    for (metric_id, (metric_term, slot)) in metric_terms.iter().zip(&registered.metrics).enumerate()
+    {
+        if !slot.describes(*metric_term) {
             return Err(StorageError::MetricKindMismatch { id: metric_id }.into());
         }
     }
@@ -638,7 +736,9 @@ fn nif_get_all_metrics<'a>(
                 encode_counter_map(env, shards)?
             }
             MetricSlot::LastValue(shards) => encode_last_value_map(env, shards)?,
-            MetricSlot::Distribution { shards, .. } => encode_distribution_map(env, shards)?,
+            MetricSlot::Distribution { labels, shards, .. } => {
+                encode_distribution_map(env, registered, *labels, shards)?
+            }
         };
 
         if len > 0 {
@@ -694,7 +794,7 @@ fn encode_merged<'a, A>(
     env: Env<'a>,
     combined: &HashMap<TagsKey, A, TermHashBuilder>,
     label: &'static str,
-    encode: impl Fn(Env<'a>, &A) -> Result<Term<'a>, StorageError>,
+    mut encode: impl FnMut(Env<'a>, &A) -> Result<Term<'a>, StorageError>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let mut keys = Vec::with_capacity(combined.len());
     let mut vals = Vec::with_capacity(combined.len());
@@ -749,6 +849,8 @@ fn encode_last_value_map<'a>(
 
 fn encode_distribution_map<'a>(
     env: Env<'a>,
+    registered: &RegisteredMetrics,
+    labels: (usize, usize),
     distributions: &Shards<DistributionCell>,
 ) -> Result<(usize, Term<'a>), StorageError> {
     let combined = merge_shards(
@@ -770,35 +872,30 @@ fn encode_distribution_map<'a>(
         },
     );
 
+    // Reuse caller-environment labels across this metric's series.
+    let (offset, len) = labels;
+    let keys: Vec<Term> = registered.labels_arena[offset..offset + len]
+        .iter()
+        .map(|label| registered.labels_env.copy_out(env, *label))
+        .collect();
+    let order = &registered.order_arena[offset..offset + len];
+
+    let mut vals: Vec<Term> = Vec::with_capacity(len);
+
     encode_merged(env, &combined, "distribution map", |env, (buckets, sum)| {
-        encode_distribution_buckets(env, buckets, *sum)
+        vals.clear();
+        vals.extend(order.iter().map(|&bucket| {
+            if bucket == SUM_SLOT {
+                sum.encode(env)
+            } else {
+                // Registration and allocation use the same bucket count.
+                buckets[bucket as usize].encode(env)
+            }
+        }));
+
+        Term::map_from_term_arrays(env, &keys, &vals)
+            .map_err(|_| StorageError::MapBuildFailed("distribution bucket map"))
     })
-}
-
-fn encode_distribution_buckets<'a>(
-    env: Env<'a>,
-    buckets: &[u64],
-    sum: i64,
-) -> Result<Term<'a>, StorageError> {
-    let overflow_idx = buckets.len().saturating_sub(1);
-    let mut keys = Vec::with_capacity(buckets.len() + 1);
-    let mut vals = Vec::with_capacity(buckets.len() + 1);
-
-    for (idx, count) in buckets.iter().enumerate() {
-        let key = if idx == overflow_idx {
-            atoms::infinity().encode(env)
-        } else {
-            (idx as u64).encode(env)
-        };
-        keys.push(key);
-        vals.push(count.encode(env));
-    }
-
-    keys.push(atoms::sum().encode(env));
-    vals.push(sum.encode(env));
-
-    Term::map_from_term_arrays(env, &keys, &vals)
-        .map_err(|_| StorageError::MapBuildFailed("distribution bucket map"))
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -920,10 +1017,9 @@ impl<V> Shards<V> {
         self.shards.len()
     }
 
-    // `resolve/1` hands back `scheduler_id - 1`, and there is one shard per
-    // scheduler.
+    // Wrap scheduler hints to the nonempty shard array.
     fn shard(&self, shard_id: usize) -> &RwLock<Shard<V>> {
-        &self.shards[shard_id].0
+        &self.shards[shard_id % self.shards.len()].0
     }
 
     /// Exactly one of `make` and `apply` runs.
