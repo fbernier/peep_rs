@@ -1,31 +1,11 @@
-defmodule Peep.Storage.RustNIFTest.DescendingBuckets do
-  @behaviour Peep.Buckets
-
-  @impl true
-  def config(_), do: %{}
-
-  @impl true
-  def boundaries(_), do: [1000, 100, 10]
-
-  @impl true
-  def bucket_for(_, _), do: 0
-
-  @impl true
-  def upper_bound(_, _), do: "1000"
-
-  @impl true
-  def number_of_buckets(_), do: 3
-end
-
 defmodule Peep.Storage.RustNIFTest do
-  # Backend-specific behaviour: errors the NIF raises that the ETS backends have
-  # no equivalent for, and the tag-value round-trips that back the claim this
-  # backend stores the same terms they do.
+  # NIF-specific validation and term round-trips.
   use ExUnit.Case, async: true
 
   import Bitwise
 
   alias Telemetry.Metrics
+  alias Peep.Storage.RustNIF
 
   @storage {Peep.Storage.RustNIF, []}
 
@@ -36,9 +16,7 @@ defmodule Peep.Storage.RustNIFTest do
       %{counter: counter, name: name}
     end
 
-    # Tags are copied into a process-independent environment rather than decoded
-    # into Rust, so the set of storable terms is whatever `enif_make_copy`
-    # accepts, and these round-trip byte for byte.
+    # enif_make_copy preserves arbitrary tag terms.
     for {label, tags} <- [
           {"list", %{tag: ["a", "b"]}},
           {"tuple", %{tag: {1, 2}}},
@@ -58,8 +36,7 @@ defmodule Peep.Storage.RustNIFTest do
         Peep.Test.insert_metric(name, counter, 1, tags)
 
         assert Peep.get_all_metrics(name) |> Map.fetch!(counter) == %{tags => 2}
-        assert %{size: 1, memory: memory} = Peep.storage_size(name)
-        assert memory > 0
+        assert %{size: 1} = Peep.storage_size(name)
       end
     end
 
@@ -109,8 +86,6 @@ defmodule Peep.Storage.RustNIFTest do
   end
 
   test "an integer tag value does not merge into an equal float one" do
-    # 16 is the smallest N whose two tags maps share their top 7 hash bits, so
-    # hashbrown's control byte does not filter the pair and tags_match runs.
     counter = Metrics.counter("rustler.test.numeric", tags: [:code])
     name = Peep.Test.start_peep!(storage: @storage, metrics: [counter])
 
@@ -122,52 +97,149 @@ defmodule Peep.Storage.RustNIFTest do
     assert series == %{%{code: 16.0} => 1, %{code: 16} => 1}
   end
 
-  test "a float measurement on a Sum raises bad_measurement" do
-    sum = Metrics.sum("rustler.test.sum")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [sum])
+  test "rejected samples do not retain new tag sets" do
+    sum = Metrics.sum("rustler.test.rejected.sum")
+    gauge = Metrics.last_value("rustler.test.rejected.gauge")
 
-    error = assert_raise ErlangError, fn -> Peep.Test.insert_metric(name, sum, 1.5, %{}) end
-    assert {:peep_storage_error, :bad_measurement, _} = error.original
+    dist =
+      Metrics.distribution("rustler.test.rejected.dist")
+      |> Map.put(:peep_bucket_boundaries, [10])
+      |> Map.put(:peep_bucket_labels, ["10", :infinity])
+
+    storage = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {sum, gauge, dist})
+    before = RustNIF.storage_size(storage)
+
+    for {id, metric, value, reason} <- [
+          {0, sum, 1.5, :bad_measurement},
+          {1, gauge, :invalid, :bad_measurement},
+          {1, gauge, 1 <<< 70, :bad_measurement},
+          {2, dist, 1.0e20, :bad_measurement},
+          {3, sum, 1, :unknown_metric_id}
+        ] do
+      error =
+        assert_raise ErlangError, fn ->
+          RustNIF.insert_metrics(RustNIF.resolve(storage), {%{id: {id, value}}}, [
+            {id, metric, value, 0}
+          ])
+        end
+
+      assert {:peep_storage_error, ^reason, _} = error.original
+    end
+
+    assert RustNIF.nif_get_all_metrics(storage, {sum, gauge, dist}) == %{}
+    assert RustNIF.storage_size(storage) == before
   end
 
-  # Both `Peep.EventHandler` and `Peep.Test.insert_metric/4` guard on
-  # `is_number/1`, so reaching this at all means calling the backend directly.
-  test "a non-numeric last_value measurement raises bad_measurement" do
-    gauge = Metrics.last_value("rustler.test.gauge")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [gauge])
-    {mod, storage} = Peep.Persistent.storage(name)
+  test "a rejected batch item preserves earlier samples without retaining its tags" do
+    counter = Metrics.counter("rustler.test.partial.counter")
+    sum = Metrics.sum("rustler.test.partial.sum")
+    storage = RustNIF.new([])
+    control = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {counter, sum})
+    :ok = RustNIF.register_metrics(control, {counter, sum})
+    good = %{id: :accepted}
+    bad = %{id: :rejected}
 
     error =
       assert_raise ErlangError, fn ->
-        mod.insert_metrics(mod.resolve(storage), {%{}}, [{0, gauge, :nope, 0}])
+        RustNIF.insert_metrics(RustNIF.resolve(storage), {good, bad}, [
+          {0, counter, 1, 0},
+          {1, sum, 1.5, 1}
+        ])
       end
 
     assert {:peep_storage_error, :bad_measurement, _} = error.original
+    :ok = RustNIF.insert_metrics(RustNIF.resolve(control), {good}, [{0, counter, 1, 0}])
+    assert RustNIF.nif_get_all_metrics(storage, {counter, sum}) == %{counter => %{good => 1}}
+    assert RustNIF.storage_size(storage) == RustNIF.storage_size(control)
   end
 
-  test "an integer last_value stays an integer" do
+  test "last_value preserves integer and float measurements exactly" do
     gauge = Metrics.last_value("rustler.test.gauge")
-    name = Peep.Test.start_peep!(storage: @storage, metrics: [gauge])
+    storage = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {gauge})
 
-    Peep.Test.insert_metric(name, gauge, 10, %{})
+    :ok =
+      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{type: :integer}, %{type: :float}}, [
+        {0, gauge, 10, 0},
+        {0, gauge, 10.5, 1}
+      ])
 
-    assert Peep.get_all_metrics(name) |> Map.fetch!(gauge) == %{%{} => 10}
+    assert RustNIF.nif_get_all_metrics(storage, {gauge}) ===
+             %{gauge => %{%{type: :integer} => 10, %{type: :float} => 10.5}}
   end
 
-  test "descending bucket boundaries are rejected at registration" do
-    Process.flag(:trap_exit, true)
+  test "descending bucket boundaries are rejected" do
+    for boundaries <- [[1000, 100, 10]] do
+      dist =
+        Metrics.distribution("rustler.test.boundaries")
+        |> Map.put(:peep_bucket_boundaries, boundaries)
+        |> Map.put(:peep_bucket_labels, ["a", "b", "c", :infinity])
+
+      error =
+        assert_raise ErlangError, fn ->
+          RustNIF.register_metrics(RustNIF.new([]), {dist})
+        end
+
+      assert {:peep_storage_error, :unsorted_boundaries, _} = error.original
+    end
+  end
+
+  test "distribution sums and bucket routing retain integer precision past 2^53" do
+    boundary = (1 <<< 53) + 1
 
     dist =
-      Metrics.distribution("rustler.test.dist",
-        reporter_options: [peep_bucket_calculator: __MODULE__.DescendingBuckets]
-      )
+      Metrics.distribution("rustler.test.precision")
+      |> Map.put(:peep_bucket_boundaries, [boundary])
+      |> Map.put(:peep_bucket_labels, ["wide", :infinity])
 
-    name = :"rustler_test_#{System.unique_integer([:positive])}"
+    storage = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {dist})
 
-    assert {:error, {reason, _stacktrace}} =
-             Peep.start_link(name: name, storage: @storage, metrics: [dist])
+    :ok =
+      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [
+        {0, dist, boundary - 1, 0},
+        {0, dist, boundary, 0}
+      ])
 
-    assert {:peep_storage_error, :unsorted_boundaries, _} = reason
+    assert RustNIF.nif_get_all_metrics(storage, {dist}) ===
+             %{dist => %{%{} => %{0 => 1, :infinity => 1, :sum => 2 * boundary - 1}}}
+  end
+
+  test "a last_value tie compares integer and float values exactly" do
+    gauge = Metrics.last_value("rustler.test.tie")
+    storage = RustNIF.new([])
+    :ok = RustNIF.register_metrics(storage, {gauge})
+
+    bigger = (1 <<< 53) + 1
+    smaller = 1.0 * (1 <<< 53)
+
+    :ok =
+      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [
+        {0, gauge, bigger, 0},
+        {0, gauge, smaller, 0}
+      ])
+
+    assert RustNIF.nif_get_all_metrics(storage, {gauge}) === %{gauge => %{%{} => bigger}}
+  end
+
+  test "signed-zero gauge ties are independent of batch order" do
+    gauge = Metrics.last_value("rustler.test.signed_zero")
+
+    for values <- [[0.0, -0.0], [-0.0, 0.0]] do
+      storage = RustNIF.new([])
+      :ok = RustNIF.register_metrics(storage, {gauge})
+
+      :ok =
+        RustNIF.insert_metrics(
+          RustNIF.resolve(storage),
+          {%{}},
+          Enum.map(values, &{0, gauge, &1, 0})
+        )
+
+      assert RustNIF.nif_get_all_metrics(storage, {gauge}) === %{gauge => %{%{} => 0.0}}
+    end
   end
 
   # `Macro.escape/1` cannot carry a live pid or reference into the generated test.

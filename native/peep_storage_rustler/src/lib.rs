@@ -7,8 +7,8 @@ use hashbrown::HashSet;
 use parking_lot::{Mutex, RwLock};
 use rustler::env::OwnedEnv;
 use rustler::sys::{
-    enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time,
-    enif_system_info, ErlNifSysInfo, ErlNifTimeUnit,
+    enif_get_double, enif_is_identical, enif_make_copy, enif_monotonic_time, enif_system_info,
+    ErlNifSysInfo, ErlNifTimeUnit,
 };
 use rustler::types::map::MapIterator;
 use rustler::types::tuple::get_tuple;
@@ -70,7 +70,8 @@ impl TagsEnv {
     }
 
     fn store(&mut self, term: NIF_TERM) -> NIF_TERM {
-        self.0.run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
+        self.0
+            .run(|owned| unsafe { enif_make_copy(owned.as_c_arg(), term) })
     }
 
     fn copy_out<'a>(&self, env: Env<'a>, term: NIF_TERM) -> Term<'a> {
@@ -143,7 +144,7 @@ impl std::panic::RefUnwindSafe for Storage {}
 
 struct RegisteredMetrics {
     metrics: Vec<MetricSlot>,
-    boundaries_arena: Box<[f64]>,
+    boundaries_arena: Box<[Measurement]>,
 }
 
 enum MetricSlot {
@@ -174,7 +175,19 @@ struct Shards<V> {
 
 const _: () = assert!(size_of::<RwLock<Shard<AtomicI64>>>() <= 128);
 
-type LastValueCell = Mutex<(i64, Measurement)>;
+/// A `last_value` timestamp and measurement.
+type Sample = (i64, Measurement);
+type LastValueCell = Mutex<Sample>;
+
+/// Timestamp ties use numeric order, then prefer floats and positive zero.
+/// This makes the winner independent of shard and insertion order.
+fn newer(sample: Sample, current: Sample) -> bool {
+    sample
+        .0
+        .cmp(&current.0)
+        .then_with(|| sample.1.term_cmp(current.1))
+        .is_gt()
+}
 
 struct DistributionCell {
     buckets: Box<[AtomicU64]>,
@@ -260,8 +273,8 @@ fn new(_opts: Term) -> ResourceArc<Storage> {
 #[rustler::nif]
 fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rustler::Error> {
     let n_shards = scheduler_count();
-    let mut boundaries_arena: Vec<f64> = Vec::new();
-    let mut interned: Vec<(Vec<f64>, usize)> = Vec::new();
+    let mut boundaries_arena: Vec<Measurement> = Vec::new();
+    let mut interned: Vec<(Vec<Measurement>, usize)> = Vec::new();
 
     let metrics = get_tuple(ids_to_metrics)
         .map_err(|_| StorageError::BadArgument("ids_to_metrics must be a tuple"))?
@@ -284,8 +297,8 @@ fn register_metrics(storage: &Storage, ids_to_metrics: Term) -> Result<Atom, rus
 
 fn metric_slot_for(
     metric: Term,
-    arena: &mut Vec<f64>,
-    interned: &mut Vec<(Vec<f64>, usize)>,
+    arena: &mut Vec<Measurement>,
+    interned: &mut Vec<(Vec<Measurement>, usize)>,
     n_shards: usize,
 ) -> Result<MetricSlot, StorageError> {
     let struct_name: Atom = metric
@@ -301,12 +314,19 @@ fn metric_slot_for(
     } else if struct_name == atoms::metric_last_value() {
         Ok(MetricSlot::LastValue(Shards::new(n_shards)))
     } else if struct_name == atoms::metric_distribution() {
-        let boundaries: Vec<f64> = metric
+        // Preserve integer boundaries: f64 loses precision above 2^53.
+        let boundaries = metric
             .map_get(atoms::peep_bucket_boundaries())
             .map_err(|_| {
                 StorageError::BadArgument("Distribution metric must carry :peep_bucket_boundaries")
             })?
-            .decode()
+            .decode::<Vec<Term>>()
+            .map_err(|_| {
+                StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
+            })?
+            .into_iter()
+            .map(Measurement::decode)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| {
                 StorageError::BadArgument(":peep_bucket_boundaries must be a list of numbers")
             })?;
@@ -321,15 +341,18 @@ fn metric_slot_for(
 }
 
 fn intern_boundaries(
-    arena: &mut Vec<f64>,
-    interned: &mut Vec<(Vec<f64>, usize)>,
-    boundaries: Vec<f64>,
+    arena: &mut Vec<Measurement>,
+    interned: &mut Vec<(Vec<Measurement>, usize)>,
+    boundaries: Vec<Measurement>,
 ) -> Result<(usize, usize), StorageError> {
-    if !boundaries.is_sorted() {
+    if !boundaries.is_sorted_by(|a, b| !a.cmp_exact(*b).is_gt()) {
         return Err(StorageError::UnsortedBoundaries);
     }
 
-    if let Some((existing, offset)) = interned.iter().find(|(existing, _)| existing == &boundaries) {
+    if let Some((existing, offset)) = interned
+        .iter()
+        .find(|(existing, _)| existing == &boundaries)
+    {
         return Ok((*offset, existing.len()));
     }
 
@@ -352,7 +375,10 @@ fn insert_metrics(
     batch: Term,
 ) -> Result<Atom, rustler::Error> {
     let (storage, shard_id) = resolved;
-    let registered = storage.registered.get().ok_or(StorageError::NotRegistered)?;
+    let registered = storage
+        .registered
+        .get()
+        .ok_or(StorageError::NotRegistered)?;
 
     let tag_terms = TupleElements::new(tag_results)
         .ok_or(StorageError::BadArgument("tag_results must be a tuple"))?;
@@ -360,6 +386,8 @@ fn insert_metrics(
     // `u64::MAX` is the "not yet computed" sentinel. A `tag_idx` past the end
     // falls back to hashing per sample.
     let mut hashes = [u64::MAX; 8];
+    // Gauges in one event share a timestamp.
+    let mut now = None;
 
     let batch = batch
         .into_list_iterator()
@@ -386,7 +414,7 @@ fn insert_metrics(
             None => tags.hash_internal(0),
         };
 
-        store_one(registered, shard_id, id, value, tags, hash)?;
+        store_one(registered, shard_id, id, value, tags, hash, &mut now)?;
     }
 
     Ok(rustler::types::atom::ok())
@@ -400,6 +428,7 @@ fn store_one(
     value: Term,
     tags: Term,
     hash: u64,
+    now: &mut Option<i64>,
 ) -> Result<(), StorageError> {
     match registered.metrics.get(id) {
         Some(MetricSlot::Counter(shards)) => {
@@ -415,12 +444,14 @@ fn store_one(
             Ok(())
         }
         Some(MetricSlot::LastValue(shards)) => {
-            let value = Measurement::decode(value)?;
-            let sample = (monotonic_time_ns(), value);
+            let sample = (
+                *now.get_or_insert_with(monotonic_time_ns),
+                Measurement::decode(value)?,
+            );
             let make = LastValueCell::new;
-            let apply = |cell: &LastValueCell, sample: (i64, Measurement)| {
+            let apply = |cell: &LastValueCell, sample: Sample| {
                 let mut current = cell.lock();
-                if sample.0 > current.0 {
+                if newer(sample, *current) {
                     *current = sample;
                 }
             };
@@ -431,16 +462,17 @@ fn store_one(
         Some(MetricSlot::Distribution { boundaries, shards }) => {
             let (offset, len) = *boundaries;
             let boundaries = &registered.boundaries_arena[offset..offset + len];
-            let measurement: f64 = value.decode().map_err(|_| {
-                StorageError::BadMeasurement("distribution value must be a number")
-            })?;
-            let make = |measurement: f64| {
+            let measurement = Measurement::decode(value)?;
+            // Resolved before `upsert` can run, so a measurement that is
+            // going to be rejected cannot leave an empty series behind.
+            let delta = measurement.rounded()?;
+            let make = |measurement: Measurement| {
                 let cell = DistributionCell::new(len);
-                cell.record(boundaries, measurement);
+                cell.record(boundaries, measurement, delta);
                 cell
             };
-            let apply = |cell: &DistributionCell, measurement: f64| {
-                cell.record(boundaries, measurement);
+            let apply = |cell: &DistributionCell, measurement: Measurement| {
+                cell.record(boundaries, measurement, delta);
             };
 
             shards.upsert(shard_id, tags, hash, measurement, make, apply);
@@ -467,8 +499,8 @@ fn storage_size(storage: &Storage) -> StorageSize {
     };
 
     let mut size = 0;
-    let mut memory =
-        size_of::<RegisteredMetrics>() + registered.boundaries_arena.len() * size_of::<f64>();
+    let mut memory = size_of::<RegisteredMetrics>()
+        + registered.boundaries_arena.len() * size_of::<Measurement>();
 
     for slot in &registered.metrics {
         let (slot_size, slot_memory) = match slot {
@@ -556,7 +588,11 @@ fn nif_get_all_metrics<'a>(
 }
 
 fn combined_capacity<V>(shards: &Shards<V>) -> usize {
-    shards.iter().map(|shard| shard.read().map.len()).max().unwrap_or(0)
+    shards
+        .iter()
+        .map(|shard| shard.read().map.len())
+        .max()
+        .unwrap_or(0)
 }
 
 /// The shard's read lock is held for its whole pass, which is what makes
@@ -573,7 +609,10 @@ fn merge_shards<V, A>(
     for shard in shards.iter() {
         let shard = shard.read();
         for (key, cell) in shard.map.iter() {
-            match combined.raw_entry_mut().from_hash(key.hash, |seen| seen == key) {
+            match combined
+                .raw_entry_mut()
+                .from_hash(key.hash, |seen| seen == key)
+            {
                 RawEntryMut::Occupied(mut entry) => merge(entry.get_mut(), cell),
                 RawEntryMut::Vacant(entry) => {
                     entry.insert(shard.tags.copy_key(env, key), init(cell));
@@ -613,7 +652,7 @@ fn encode_counter_map<'a>(
         env,
         counters,
         |cell: &AtomicI64| cell.load(Ordering::Relaxed),
-        |total, cell| *total += cell.load(Ordering::Relaxed),
+        |total, cell| *total = total.wrapping_add(cell.load(Ordering::Relaxed)),
     );
 
     encode_merged(env, &combined, "counter map", |env, total| {
@@ -631,7 +670,7 @@ fn encode_last_value_map<'a>(
         |cell: &LastValueCell| *cell.lock(),
         |newest, cell| {
             let sample = *cell.lock();
-            if sample.0 > newest.0 {
+            if newer(sample, *newest) {
                 *newest = sample;
             }
         },
@@ -650,15 +689,18 @@ fn encode_distribution_map<'a>(
         env,
         distributions,
         |cell: &DistributionCell| {
-            let buckets: Vec<u64> =
-                cell.buckets.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+            let buckets: Vec<u64> = cell
+                .buckets
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect();
             (buckets, cell.sum.load(Ordering::Relaxed))
         },
         |(buckets, sum), cell| {
             for (bucket, cell) in buckets.iter_mut().zip(cell.buckets.iter()) {
-                *bucket += cell.load(Ordering::Relaxed);
+                *bucket = bucket.wrapping_add(cell.load(Ordering::Relaxed));
             }
-            *sum += cell.sum.load(Ordering::Relaxed);
+            *sum = sum.wrapping_add(cell.sum.load(Ordering::Relaxed));
         },
     );
 
@@ -833,7 +875,10 @@ impl<V> Shards<V> {
         // Fast path.
         {
             let shard = shard_lock.read();
-            if let Some((_, value)) = shard.map.raw_entry().from_hash(hash, |key| key.matches(tags))
+            if let Some((_, value)) = shard
+                .map
+                .raw_entry()
+                .from_hash(hash, |key| key.matches(tags))
             {
                 apply(value, sample);
                 return;
@@ -882,10 +927,10 @@ impl DistributionCell {
         }
     }
 
-    fn record(&self, boundaries: &[f64], value: f64) {
-        let idx = boundaries.partition_point(|&boundary| boundary <= value);
+    fn record(&self, boundaries: &[Measurement], value: Measurement, delta: i64) {
+        let idx = boundaries.partition_point(|boundary| !boundary.cmp_exact(value).is_gt());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(value.round() as i64, Ordering::Relaxed);
+        self.sum.fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -939,24 +984,107 @@ impl Hash for TagsKey {
     }
 }
 
-#[derive(Clone, Copy)]
+/// 2^63: exactly representable and the first `f64` above `i64::MAX`.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// Compare without rounding `int` to f64; guards also handle non-finite floats.
+fn cmp_int_float(int: i64, float: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    if float.is_nan() {
+        return Ordering::Greater;
+    }
+    if float >= TWO_POW_63 {
+        return Ordering::Less;
+    }
+    if float < -TWO_POW_63 {
+        return Ordering::Greater;
+    }
+
+    // Truncation avoids a floor/libm call on baseline x86-64; range guards
+    // prevent saturating conversion.
+    let trunc = float as i64;
+
+    match int.cmp(&trunc) {
+        // Equal integer parts: compare the signed fractional remainder.
+        Ordering::Equal => (trunc as f64)
+            .partial_cmp(&float)
+            .unwrap_or(Ordering::Equal),
+        ordering => ordering,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum Measurement {
     Int(i64),
     Float(f64),
 }
 
 impl Measurement {
+    /// Decode directly; query the type only to distinguish overflow from non-numbers.
     fn decode(term: Term) -> Result<Self, StorageError> {
-        match term.get_type() {
-            TermType::Integer => term
-                .decode()
-                .map(Measurement::Int)
-                .map_err(|_| StorageError::BadMeasurement("integer does not fit in 64 bits")),
-            TermType::Float => term_as_f64(term)
-                .map(Measurement::Float)
-                .ok_or(StorageError::BadMeasurement("float")),
-            _ => Err(StorageError::BadMeasurement("last_value must be a number")),
+        if let Ok(int) = term.decode::<i64>() {
+            return Ok(Measurement::Int(int));
         }
+
+        if let Some(float) = term_as_f64(term) {
+            return Ok(Measurement::Float(float));
+        }
+
+        Err(match term.get_type() {
+            TermType::Integer => StorageError::BadMeasurement("integer does not fit in 64 bits"),
+            _ => StorageError::BadMeasurement("measurement must be a number"),
+        })
+    }
+
+    /// Match :atomics' signed 64-bit range; reject overflow before Rust's
+    /// saturating float-to-int cast.
+    fn rounded(self) -> Result<i64, StorageError> {
+        match self {
+            Measurement::Int(int) => Ok(int),
+            Measurement::Float(float) => {
+                let rounded = float.round();
+
+                if rounded.is_finite() && (-TWO_POW_63..TWO_POW_63).contains(&rounded) {
+                    Ok(rounded as i64)
+                } else {
+                    Err(StorageError::BadMeasurement(
+                        "distribution value does not fit in 64 bits",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Numeric comparison without losing integer precision above 2^53.
+    fn cmp_exact(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        match (self, other) {
+            (Measurement::Int(a), Measurement::Int(b)) => a.cmp(&b),
+            (Measurement::Float(a), Measurement::Float(b)) => {
+                a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+            }
+            (Measurement::Int(a), Measurement::Float(b)) => cmp_int_float(a, b),
+            (Measurement::Float(a), Measurement::Int(b)) => cmp_int_float(b, a).reverse(),
+        }
+    }
+
+    fn type_rank(self) -> u8 {
+        match self {
+            Measurement::Int(_) => 0,
+            Measurement::Float(_) => 1,
+        }
+    }
+
+    /// Unlike bucket comparisons, last_value ties distinguish representations.
+    fn term_cmp(self, other: Self) -> std::cmp::Ordering {
+        self.cmp_exact(other)
+            .then_with(|| self.type_rank().cmp(&other.type_rank()))
+            .then_with(|| match (self, other) {
+                (Measurement::Float(a), Measurement::Float(b)) => a.total_cmp(&b),
+                _ => std::cmp::Ordering::Equal,
+            })
     }
 }
 
@@ -968,7 +1096,5 @@ impl Encoder for Measurement {
         }
     }
 }
-
-
 
 rustler::init!("Elixir.Peep.Storage.RustNIF");
