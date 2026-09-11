@@ -20,13 +20,13 @@ defmodule Peep.Storage.RustNIF.MixProject do
   defp deps do
     [
       {:peep, path: "../../elixir/peep-rust"},
-      # Forked for `Term::hash_internal/1`: upstream truncates
-      # `ERL_NIF_INTERNAL_HASH` to 32 bits, and the shard maps are keyed by it.
+      # Match Cargo.toml's hash fix and override Peep's Hex dependency.
       {:rustler,
-       git: "https://github.com/rkallos/rustler.git",
-       branch: "fix/internal-hash-64bit",
+       git: "https://github.com/rusterlium/rustler.git",
+       ref: "0ba085adabd26632506aeeb3fae7534c9eff96d1",
        sparse: "rustler_mix",
-       runtime: false}
+       runtime: false,
+       override: true}
     ]
   end
 end

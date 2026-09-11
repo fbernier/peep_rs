@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "rustler"
 version = "0.38.0"
-source = "git+https://github.com/rkallos/rustler.git?rev=1eb6b6679bac7dee7a2dbd15579ac73536558577#1eb6b6679bac7dee7a2dbd15579ac73536558577"
+source = "git+https://github.com/rusterlium/rustler.git?rev=0ba085adabd26632506aeeb3fae7534c9eff96d1#0ba085adabd26632506aeeb3fae7534c9eff96d1"
 dependencies = [
  "inventory",
  "libc",
@@ -156,7 +156,7 @@ dependencies = [
 [[package]]
 name = "rustler_codegen"
 version = "0.38.0"
-source = "git+https://github.com/rkallos/rustler.git?rev=1eb6b6679bac7dee7a2dbd15579ac73536558577#1eb6b6679bac7dee7a2dbd15579ac73536558577"
+source = "git+https://github.com/rusterlium/rustler.git?rev=0ba085adabd26632506aeeb3fae7534c9eff96d1#0ba085adabd26632506aeeb3fae7534c9eff96d1"
 dependencies = [
  "heck",
  "inventory",

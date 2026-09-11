@@ -3,5 +3,11 @@ resolver = "2"
 
 members = ["native/peep_storage_rustler"]
 
+# Rustler #758 fixes 64-bit internal hashes; replace the pin once released.
 [patch.crates-io]
-rustler = { git = "https://github.com/rkallos/rustler.git", rev = "1eb6b6679bac7dee7a2dbd15579ac73536558577" }
+rustler = { git = "https://github.com/rusterlium/rustler.git", rev = "0ba085adabd26632506aeeb3fae7534c9eff96d1" }
+
+# Cross-crate inlining; retain unwinding for Rustler's panic handler.
+[profile.release]
+lto = true
+codegen-units = 1

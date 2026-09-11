@@ -16,15 +16,13 @@ Peep.start_link(
 
 ## Development
 
-`mix compile` builds the Rust crate under `native/peep_storage_rustler`, so a
-Rust toolchain (`cargo`) must be on `PATH`. A Nix flake providing Erlang,
-Elixir, and the Rust toolchain is included:
+`mix compile` builds the Rust crate under `native/peep_storage_rustler`.
+It requires Cargo and OTP 29 (`enif_term_size`, NIF 2.18). The Nix flake supplies
+Erlang, Elixir and Rust:
 
     direnv allow   # or: nix develop
 
-`peep` is a path dependency (see `mix.exs`). The test suite runs Peep's shared
-storage conformance tests (`test/shared/storage_test.exs`, shipped with the peep
-dependency) against the Rust NIF backend, plus backend-specific tests in
-`test/peep/storage/rust_nif_test.exs`:
+`peep` is a path dependency (see `mix.exs`). Tests include Peep's shared storage
+suite and `test/peep/storage/rust_nif_test.exs`:
 
     mix test

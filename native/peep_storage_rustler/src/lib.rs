@@ -99,9 +99,7 @@ fn tags_term<'a>(env: Env<'a>, key: &TagsKey) -> Term<'a> {
     unsafe { Term::new(env, key.term) }
 }
 
-// rustler's f64 decoder falls back to integer decoding.
-// We don't want this behavior in Measurement::decode().
-// 5 and 5.0 must not be stored as the same value.
+// Bypass Rustler's integer-to-float coercion.
 fn term_as_f64(term: Term) -> Option<f64> {
     let mut value = 0f64;
     let found =
@@ -941,8 +939,6 @@ impl Hash for TagsKey {
     }
 }
 
-/// `Peep.EventHandler` drops non-numeric measurements before any backend sees
-/// them, so these are the only two shapes that arrive.
 #[derive(Clone, Copy)]
 enum Measurement {
     Int(i64),
