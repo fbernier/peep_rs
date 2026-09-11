@@ -39,9 +39,21 @@ defmodule Peep.Storage.RustNIF do
   @impl true
   def storage_size(_), do: :erlang.nif_error(:nif_not_loaded)
 
-  # Amortize the NIF call overhead by batching inserts
+  # A contended event has not written anything yet. Its continuation keeps the
+  # original shard, but waits for the lock on a dirty scheduler.
   @impl true
-  def insert_metrics(_resolved, _tag_results, _batch), do: :erlang.nif_error(:nif_not_loaded)
+  def insert_metrics(storage, tag_results, batch) do
+    case nif_insert_metrics(storage, tag_results, batch) do
+      :ok -> :ok
+      {:contended, shard_id} -> nif_insert_metrics_dirty(storage, shard_id, tag_results, batch)
+    end
+  end
+
+  def nif_insert_metrics(_storage, _tag_results, _batch),
+    do: :erlang.nif_error(:nif_not_loaded)
+
+  def nif_insert_metrics_dirty(_storage, _shard_id, _tag_results, _batch),
+    do: :erlang.nif_error(:nif_not_loaded)
 
   @impl true
   def get_all_metrics(storage, persistent) do
@@ -53,8 +65,7 @@ defmodule Peep.Storage.RustNIF do
   @impl true
   def prune_tags(_, _), do: :erlang.nif_error(:nif_not_loaded)
 
-  # No erl_nif equivalent of `:erlang.system_info(:scheduler_id)` exists;
-  # `enif_thread_type/0` says what kind of scheduler this is, not which one.
+  # Select the shard inside the NIF: the process can migrate before the call.
   @impl true
-  def resolve(storage), do: {storage, :erlang.system_info(:scheduler_id) - 1}
+  def resolve(storage), do: storage
 end

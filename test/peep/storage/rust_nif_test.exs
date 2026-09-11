@@ -139,9 +139,7 @@ defmodule Peep.Storage.RustNIFTest do
         ] do
       error =
         assert_raise ErlangError, fn ->
-          RustNIF.insert_metrics(RustNIF.resolve(storage), {%{id: {id, value}}}, [
-            {id, metric, value, 0}
-          ])
+          RustNIF.insert_metrics(storage, {%{id: {id, value}}}, [{id, metric, value, 0}])
         end
 
       assert {:peep_storage_error, ^reason, _} = error.original
@@ -163,14 +161,14 @@ defmodule Peep.Storage.RustNIFTest do
 
     error =
       assert_raise ErlangError, fn ->
-        RustNIF.insert_metrics(RustNIF.resolve(storage), {good, bad}, [
+        RustNIF.insert_metrics(storage, {good, bad}, [
           {0, counter, 1, 0},
           {1, sum, 1.5, 1}
         ])
       end
 
     assert {:peep_storage_error, :bad_measurement, _} = error.original
-    :ok = RustNIF.insert_metrics(RustNIF.resolve(control), {good}, [{0, counter, 1, 0}])
+    :ok = RustNIF.insert_metrics(control, {good}, [{0, counter, 1, 0}])
     assert RustNIF.nif_get_all_metrics(storage, {counter, sum}) == %{counter => %{good => 1}}
     assert RustNIF.storage_size(storage) == RustNIF.storage_size(control)
   end
@@ -181,7 +179,7 @@ defmodule Peep.Storage.RustNIFTest do
     :ok = RustNIF.register_metrics(storage, {gauge})
 
     :ok =
-      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{type: :integer}, %{type: :float}}, [
+      RustNIF.insert_metrics(storage, {%{type: :integer}, %{type: :float}}, [
         {0, gauge, 10, 0},
         {0, gauge, 10.5, 1}
       ])
@@ -233,7 +231,7 @@ defmodule Peep.Storage.RustNIFTest do
     :ok = RustNIF.nif_register_metrics(storage, {dist})
 
     :ok =
-      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [
+      RustNIF.insert_metrics(storage, {%{}}, [
         {0, dist, boundary - 1, 0},
         {0, dist, boundary, 0}
       ])
@@ -251,7 +249,7 @@ defmodule Peep.Storage.RustNIFTest do
     smaller = 1.0 * (1 <<< 53)
 
     :ok =
-      RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [
+      RustNIF.insert_metrics(storage, {%{}}, [
         {0, gauge, bigger, 0},
         {0, gauge, smaller, 0}
       ])
@@ -268,7 +266,7 @@ defmodule Peep.Storage.RustNIFTest do
 
       :ok =
         RustNIF.insert_metrics(
-          RustNIF.resolve(storage),
+          storage,
           {%{}},
           Enum.map(values, &{0, gauge, &1, 0})
         )
@@ -282,7 +280,7 @@ defmodule Peep.Storage.RustNIFTest do
     sum = Metrics.sum("rustler.test.mismatch.sum")
     storage = RustNIF.new([])
     :ok = RustNIF.register_metrics(storage, {counter, sum})
-    :ok = RustNIF.insert_metrics(RustNIF.resolve(storage), {%{}}, [{0, counter, 1, 0}])
+    :ok = RustNIF.insert_metrics(storage, {%{}}, [{0, counter, 1, 0}])
 
     for wrong <- [{}, {sum, counter}] do
       error = assert_raise ErlangError, fn -> RustNIF.nif_get_all_metrics(storage, wrong) end
@@ -305,6 +303,59 @@ defmodule Peep.Storage.RustNIFTest do
 
     other = Metrics.counter("rustler.test.repeated.other")
     assert :ok = RustNIF.register_metrics(storage, {counter, other})
+  end
+
+  test "storage_size follows tag membership changes after a cached read" do
+    counter = Metrics.counter("rustler.test.cached_size")
+    batch = [{0, counter, 1, 0}]
+
+    fresh = fn tags ->
+      storage = RustNIF.new([])
+      :ok = RustNIF.register_metrics(storage, {counter})
+      Enum.each(tags, &RustNIF.insert_metrics(storage, {&1}, batch))
+      storage
+    end
+
+    small = %{id: 1}
+    large = %{id: 2, data: List.duplicate({:payload, "value"}, 50)}
+    storage = fresh.([small])
+    assert %{size: 1} = RustNIF.storage_size(storage)
+
+    :ok = RustNIF.insert_metrics(storage, {large}, batch)
+    assert RustNIF.storage_size(storage) == RustNIF.storage_size(fresh.([small, large]))
+
+    :ok = RustNIF.prune_tags(storage, [small])
+    assert RustNIF.storage_size(storage) == RustNIF.storage_size(fresh.([large]))
+
+    :ok = RustNIF.insert_metrics(storage, {large}, batch)
+    assert RustNIF.nif_get_all_metrics(storage, {counter}) == %{counter => %{large => 2}}
+
+    :ok = RustNIF.prune_tags(storage, [%{}])
+    assert RustNIF.storage_size(storage) == RustNIF.storage_size(fresh.([]))
+  end
+
+  # Pruning compacts tag IDs shared by all metric kinds.
+  test "pruning preserves every surviving metric series" do
+    counter = Metrics.counter("rustler.test.prune.count", tags: [:id])
+    sum = Metrics.sum("rustler.test.prune.bytes", tags: [:id])
+    gauge = Metrics.last_value("rustler.test.prune.size", tags: [:id])
+
+    name = Peep.Test.start_peep!(storage: @storage, metrics: [counter, sum, gauge])
+
+    for i <- 1..20 do
+      Peep.Test.insert_metric(name, counter, 1, %{id: i})
+      Peep.Test.insert_metric(name, sum, i, %{id: i})
+      Peep.Test.insert_metric(name, gauge, i, %{id: i})
+    end
+
+    :ok = Peep.prune_tags(name, for(i <- 2..20//2, do: %{id: i}))
+    survivors = for i <- 1..20//2, do: %{id: i}
+
+    assert Peep.get_all_metrics(name) == %{
+             counter => Map.new(survivors, &{&1, 1}),
+             sum => Map.new(survivors, &{&1, &1.id}),
+             gauge => Map.new(survivors, &{&1, &1.id})
+           }
   end
 
   # `Macro.escape/1` cannot carry a live pid or reference into the generated test.
